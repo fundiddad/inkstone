@@ -7,6 +7,7 @@ import type {
   ProjectInfo,
   SessionResponse,
 } from './types'
+import { hydrateToolMessages } from './tool-cache'
 
 class ApiError extends Error {
   constructor(
@@ -376,7 +377,8 @@ export async function fetchConversation(
     { headers: auth(token) },
     cancel,
   )
-  return (await res.json()) as ConversationDetail
+  const conv = (await res.json()) as ConversationDetail
+  return hydrateToolMessages(conv)
 }
 
 export interface FileDownloadTarget {
