@@ -199,7 +199,17 @@ function renderMessage(msg: Message, ctx: RenderCtx): string | null {
   const blocks: string[] = []
   const inlineImageIds = new Set<string>()
 
-  if (msg.author?.role === 'tool') {
+  const toolHasInlineImage =
+    msg.author?.role === 'tool' &&
+    c.content_type === 'multimodal_text' &&
+    (c.parts ?? []).some(
+      (p) =>
+        typeof p !== 'string' &&
+        p.content_type === 'image_asset_pointer' &&
+        typeof p.asset_pointer === 'string',
+    )
+
+  if (msg.author?.role === 'tool' && c.content_type !== 'execution_output' && !toolHasInlineImage) {
     if (!ctx.toolTraces) return null
     const name =
       (typeof msg.metadata?.inkstone_tool_name === 'string' && msg.metadata.inkstone_tool_name) ||

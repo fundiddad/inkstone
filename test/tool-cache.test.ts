@@ -8,6 +8,7 @@ const cacheKey = (id: string): string => `inkstone:tool-cache:v1:${id}`
 const memory = new Map<string, string>()
 Object.defineProperty(globalThis, 'localStorage', {
   configurable: true,
+  writable: true,
   value: {
     getItem: (key: string) => memory.get(key) ?? null,
     setItem: (key: string, value: string) => {
