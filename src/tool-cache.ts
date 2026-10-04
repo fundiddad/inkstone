@@ -187,44 +187,43 @@ function scan(value: unknown, inheritedId: string | null = null, depth = 0): voi
       : typeof object.conversationId === 'string'
         ? object.conversationId
         : inheritedId
-  const effectiveId = id ?? conversationId()
 
   const author = object.author as { role?: unknown } | undefined
-  if (author?.role === 'tool' && typeof object.id === 'string') saveMessage(effectiveId, object as unknown as Message)
+  if (author?.role === 'tool' && typeof object.id === 'string') saveMessage(id, object as unknown as Message)
 
-  if (Array.isArray(object.toolCalls)) saveGroup(effectiveId, object.toolCalls)
-  if (Array.isArray(object.tool_calls)) saveGroup(effectiveId, object.tool_calls)
+  if (Array.isArray(object.toolCalls)) saveGroup(id, object.toolCalls)
+  if (Array.isArray(object.tool_calls)) saveGroup(id, object.tool_calls)
 
   for (const child of Object.values(object)) scan(child, id, depth + 1)
 }
 
-function consumeJson(raw: string): void {
+function consumeJson(raw: string, requestId: string | null): void {
   const text = raw.trim()
   if (!text || text === '[DONE]') return
   try {
-    scan(JSON.parse(text), conversationId())
+    scan(JSON.parse(text), requestId)
     return
   } catch {}
   const framed = /^[0-9a-f]+:(.*)$/s.exec(text)
   if (!framed?.[1]) return
   try {
-    scan(JSON.parse(framed[1]), conversationId())
+    scan(JSON.parse(framed[1]), requestId)
   } catch {}
 }
 
-function consumeText(raw: string): void {
+function consumeText(raw: string, requestId: string | null): void {
   if (!raw || raw.length > MAX_RESPONSE_CHARS) return
-  consumeJson(raw)
+  consumeJson(raw, requestId)
   let data: string[] = []
   for (const source of raw.split('\n')) {
     const line = source.replace(/\r$/, '')
     if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
     else if (line === '') {
-      if (data.length > 0) consumeJson(data.join('\n'))
+      if (data.length > 0) consumeJson(data.join('\n'), requestId)
       data = []
-    } else if (!line.startsWith(':') && data.length === 0) consumeJson(line)
+    } else if (!line.startsWith(':') && data.length === 0) consumeJson(line, requestId)
   }
-  if (data.length > 0) consumeJson(data.join('\n'))
+  if (data.length > 0) consumeJson(data.join('\n'), requestId)
 }
 
 function sameOrigin(raw: unknown): boolean {
@@ -242,12 +241,23 @@ function sameOrigin(raw: unknown): boolean {
 const textual = (contentType: string | null): boolean =>
   !contentType || /json|event-stream|text\/plain|text\/x-component|ndjson|jsonl/i.test(contentType)
 
-async function captureResponse(response: Response, rawUrl: unknown): Promise<void> {
+// Freeze the fallback when a request starts; never attribute a late response to
+// whichever conversation happens to be open when the body finishes loading.
+function requestConversationId(rawUrl: unknown): string | null {
+  try {
+    const path = new URL(String(rawUrl), location.origin).pathname
+    const explicit = /\/(?:conversation|c)\/([0-9a-f][0-9a-f-]{10,})(?:\/|$)/i.exec(path)?.[1]
+    if (explicit) return explicit
+  } catch {}
+  return conversationId()
+}
+
+async function captureResponse(response: Response, rawUrl: unknown, requestId: string | null): Promise<void> {
   try {
     if (!sameOrigin(rawUrl ?? response.url) || !textual(response.headers.get('content-type'))) return
     const length = Number(response.headers.get('content-length') ?? 0)
     if (Number.isFinite(length) && length > MAX_RESPONSE_CHARS) return
-    consumeText(await response.text())
+    consumeText(await response.text(), requestId)
   } catch {}
 }
 
@@ -261,11 +271,12 @@ export function installToolCapture(): void {
   if (typeof originalFetch === 'function' && !originalFetch.__inkstoneToolCapture) {
     const wrapped = function (this: unknown, input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
       const rawUrl = typeof input === 'string' || input instanceof URL ? String(input) : input.url
+      const requestId = requestConversationId(rawUrl)
       const promise = Reflect.apply(originalFetch, this, [input, init]) as Promise<Response>
       if (!sameOrigin(rawUrl)) return promise
       return Promise.resolve(promise).then((response) => {
         try {
-          void captureResponse(response.clone(), rawUrl)
+          void captureResponse(response.clone(), rawUrl, requestId)
         } catch {}
         return response
       })
@@ -280,6 +291,7 @@ export function installToolCapture(): void {
   const xhrProto = XHR?.prototype as (XMLHttpRequest & {
     __inkstoneCaptureUrl?: string
     __inkstoneCaptureBound?: boolean
+    __inkstoneCaptureConversationId?: string | null
     open: XMLHttpRequest['open'] & { __inkstoneToolCapture?: boolean }
   }) | undefined
   if (xhrProto && !xhrProto.open.__inkstoneToolCapture) {
@@ -297,14 +309,18 @@ export function installToolCapture(): void {
     try {
       xhrProto.open = wrappedOpen
       xhrProto.send = function (this: typeof xhrProto, body?: Document | XMLHttpRequestBodyInit | null): void {
+        this.__inkstoneCaptureConversationId = requestConversationId(this.__inkstoneCaptureUrl)
         if (!this.__inkstoneCaptureBound) {
           this.__inkstoneCaptureBound = true
           this.addEventListener('loadend', () => {
             try {
               if (!sameOrigin(this.__inkstoneCaptureUrl) || !textual(this.getResponseHeader('content-type'))) return
-              if (this.responseType === '' || this.responseType === 'text') consumeText(this.responseText)
-              else if (this.responseType === 'json') scan(this.response, conversationId())
-              else if (this.responseType === 'blob') void this.response.text().then(consumeText).catch(() => {})
+              const requestId = this.__inkstoneCaptureConversationId ?? null
+              if (this.responseType === '' || this.responseType === 'text') consumeText(this.responseText, requestId)
+              else if (this.responseType === 'json') scan(this.response, requestId)
+              else if (this.responseType === 'blob') {
+                void this.response.text().then((text: string) => consumeText(text, requestId)).catch(() => {})
+              }
             } catch {}
           })
         }
@@ -316,8 +332,9 @@ export function installToolCapture(): void {
   const NativeEventSource = page.EventSource as (typeof EventSource & { __inkstoneToolCapture?: boolean }) | undefined
   if (typeof NativeEventSource === 'function' && !NativeEventSource.__inkstoneToolCapture) {
     const WrappedEventSource = function (url: string | URL, config?: EventSourceInit): EventSource {
+      const requestId = requestConversationId(url)
       const source = Reflect.construct(NativeEventSource, [url, config]) as EventSource
-      if (sameOrigin(url)) source.addEventListener('message', (event) => consumeText(event.data))
+      if (sameOrigin(url)) source.addEventListener('message', (event) => consumeText(event.data, requestId))
       return source
     }
     try {
@@ -331,6 +348,7 @@ export function installToolCapture(): void {
   const NativeWebSocket = page.WebSocket as (typeof WebSocket & { __inkstoneToolCapture?: boolean }) | undefined
   if (typeof NativeWebSocket === 'function' && !NativeWebSocket.__inkstoneToolCapture) {
     const WrappedWebSocket = function (url: string | URL, protocols?: string | string[]): WebSocket {
+      const requestId = requestConversationId(url)
       const socket = Reflect.construct(
         NativeWebSocket,
         protocols === undefined ? [url] : [url, protocols],
@@ -338,9 +356,9 @@ export function installToolCapture(): void {
       if (sameOrigin(url)) {
         socket.addEventListener('message', async (event) => {
           try {
-            if (typeof event.data === 'string') consumeText(event.data)
-            else if (event.data instanceof Blob) consumeText(await event.data.text())
-            else if (event.data instanceof ArrayBuffer) consumeText(new TextDecoder().decode(event.data))
+            if (typeof event.data === 'string') consumeText(event.data, requestId)
+            else if (event.data instanceof Blob) consumeText(await event.data.text(), requestId)
+            else if (event.data instanceof ArrayBuffer) consumeText(new TextDecoder().decode(event.data), requestId)
           } catch {}
         })
       }
@@ -452,29 +470,32 @@ export function hydrateToolMessages(conv: ConversationDetail): ConversationDetai
     if (invocation) pairs.push({ msg, signature: invocation })
   }
 
-  const used = new Set<number>()
+  const proposals = new Map<Message, ToolCall[]>()
   for (const group of cache.groups) {
     const calls = group.calls ?? []
     if (calls.length === 0 || calls.length > pairs.length) continue
     const signatures = calls.map((call) => call.signature ?? signature(call.name, call.toolInput ?? {}))
-    const candidates: Array<{ start: number; empty: number; overlap: number }> = []
+    const candidates: number[] = []
     for (let i = 0; i <= pairs.length - signatures.length; i++) {
       if (!signatures.every((sig, j) => pairs[i + j]?.signature === sig)) continue
-      let empty = 0
-      let overlap = 0
-      for (let j = 0; j < signatures.length; j++) {
-        if (!hasPayload(pairs[i + j]!.msg)) empty++
-        if (used.has(i + j)) overlap++
-      }
-      candidates.push({ start: i, empty, overlap })
+      candidates.push(i)
     }
-    candidates.sort((a, b) => b.empty - a.empty || a.overlap - b.overlap || a.start - b.start)
-    const start = candidates[0]?.start
-    if (start == null) continue
+    // A signature is not an identity: repeated calls may return different data.
+    // Even a populated candidate must count, otherwise its result can be copied
+    // into a later empty occurrence. Message-ID captures above remain safe.
+    if (candidates.length !== 1) continue
+    const start = candidates[0]!
     for (let j = 0; j < calls.length; j++) {
-      applyOutput(pairs[start + j]!.msg, calls[j]!)
-      used.add(start + j)
+      const msg = pairs[start + j]!.msg
+      const pending = proposals.get(msg) ?? []
+      pending.push(calls[j]!)
+      proposals.set(msg, pending)
     }
+  }
+  for (const [msg, calls] of proposals) {
+    // Multiple captures for one unambiguous position can still disagree.
+    if (new Set(calls.map((call) => canonical(call.toolOutput))).size !== 1) continue
+    applyOutput(msg, calls[0]!)
   }
   return conv
 }
